@@ -4,9 +4,9 @@ PromptGuard API Routes
 
 import json
 import uuid
-import random
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 
@@ -19,23 +19,11 @@ from db.models import RequestLog
 from firewall.risk_scorer import RiskScorer
 from firewall.sanitizer import PromptSanitizer
 from firewall.context_manager import context_manager
+from llm_service import call_llm, stream_llm, is_openai_available
 
 router = APIRouter()
 risk_scorer = RiskScorer()
 sanitizer = PromptSanitizer()
-
-# ─── Mock LLM responses ──────────────────────────────────────────────────────
-MOCK_RESPONSES = [
-    "That's a great question! Here's what I know about that topic...",
-    "I'd be happy to help with that. Let me explain step by step.",
-    "Based on my knowledge, the answer involves several key factors.",
-    "Great question! The main thing to understand here is...",
-    "Here's a helpful breakdown of what you're asking about.",
-]
-
-
-def _mock_llm(prompt: str) -> str:
-    return random.choice(MOCK_RESPONSES) + f" (Responding to: '{prompt[:60]}...')" if len(prompt) > 60 else random.choice(MOCK_RESPONSES)
 
 
 # ─── /analyze ────────────────────────────────────────────────────────────────
@@ -133,6 +121,7 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
 
     llm_response = None
     processed_prompt = req.text
+    llm_model_label = "mock"
 
     if result.action == "BLOCK":
         llm_response = None
@@ -144,8 +133,9 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
         else:
             processed_prompt = req.text
 
-        # Call LLM (mock or real)
-        llm_response = _mock_llm(processed_prompt)
+        # Call real LLM (falls back to mock if no API key)
+        use_real = (req.llm_model != "mock")
+        llm_response, llm_model_label = await call_llm(processed_prompt, use_real=use_real)
         blocked = False
 
     context_manager.add_turn(session_id, req.text, result.risk_level, adjusted_score)
@@ -189,6 +179,102 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
         llm_response=llm_response,
         blocked=blocked,
         request_id=log.id,
+    )
+
+
+# ─── /chat/stream ────────────────────────────────────────────────────────────
+
+@router.post("/chat/stream")
+async def chat_stream(req: ChatRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Same firewall logic as /chat but streams the LLM response token-by-token
+    via Server-Sent Events (SSE).
+    """
+    session_id = req.session_id or str(uuid.uuid4())
+
+    # Score
+    result = risk_scorer.score(req.text)
+    boost = context_manager.get_context_risk_boost(session_id)
+    adjusted_score = min(result.raw_score + boost, 1.0)
+
+    if boost > 0:
+        if adjusted_score >= 0.65:
+            result.risk_level = "DANGEROUS"
+            result.action = "BLOCK"
+        elif adjusted_score >= 0.30:
+            result.risk_level = "SUSPICIOUS"
+            result.action = "SANITIZE"
+
+    context_manager.add_turn(session_id, req.text, result.risk_level, adjusted_score)
+
+    async def event_generator():
+        # First, send the firewall decision as a JSON event
+        fw_payload = json.dumps({
+            "type": "firewall",
+            "risk_level": result.risk_level,
+            "action": result.action,
+            "raw_score": round(adjusted_score, 4),
+            "ml_score": round(result.ml_score, 4),
+            "rule_score": round(result.rule_score, 4),
+            "attack_category": result.attack_category,
+            "matched_rules": result.matched_rules,
+            "explanation": result.explanation,
+            "confidence": round(result.confidence, 4),
+            "context_boost": boost,
+            "model_used": result.model_used,
+            "openai_available": is_openai_available(),
+        })
+        yield f"data: {fw_payload}\n\n"
+
+        if result.action == "BLOCK":
+            yield f"data: {json.dumps({'type': 'blocked'})}\n\n"
+            return
+
+        # Sanitize if needed
+        processed = req.text
+        if result.action == "SANITIZE":
+            san = sanitizer.sanitize(req.text, result.attack_category, result.risk_level)
+            processed = san.sanitized
+            yield f"data: {json.dumps({'type': 'sanitized', 'text': processed})}\n\n"
+
+        # Stream LLM tokens
+        full_response = []
+        async for chunk in stream_llm(processed):
+            full_response.append(chunk)
+            yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+
+        full_text = "".join(full_response)
+
+        # Persist to DB
+        log = RequestLog(
+            session_id=session_id,
+            original_prompt=req.text,
+            sanitized_prompt=processed if processed != req.text else None,
+            risk_level=result.risk_level,
+            action=result.action,
+            raw_score=adjusted_score,
+            ml_score=result.ml_score,
+            rule_score=result.rule_score,
+            attack_category=result.attack_category,
+            matched_rules=json.dumps(result.matched_rules),
+            explanation=result.explanation,
+            llm_response=full_text,
+            context_boost=boost,
+            model_used=result.model_used,
+        )
+        db.add(log)
+        await db.commit()
+        await db.refresh(log)
+
+        yield f"data: {json.dumps({'type': 'done', 'request_id': log.id})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -272,5 +358,6 @@ async def health():
     return {
         "status": "ok",
         "ml_model": risk_scorer.classifier.is_ready(),
+        "openai_configured": is_openai_available(),
         "version": "1.0.0",
     }
