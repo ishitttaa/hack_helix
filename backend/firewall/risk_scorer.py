@@ -9,12 +9,14 @@ from firewall.classifier import PromptClassifier, ClassifierResult
 from firewall.rule_engine import RuleEngine, RuleMatch
 
 # ─── Risk Thresholds ─────────────────────────────────────────────────────────
-SAFE_THRESHOLD = 0.30
-SUSPICIOUS_THRESHOLD = 0.65
+# Raised from 0.30 / 0.65 → more headroom for legitimate prompts.
+SAFE_THRESHOLD = 0.40
+SUSPICIOUS_THRESHOLD = 0.72
 
 # ─── Weight distribution ─────────────────────────────────────────────────────
-ML_WEIGHT = 0.55
-RULE_WEIGHT = 0.45
+# Slightly upweight the rule engine (it now has much tighter patterns).
+ML_WEIGHT = 0.50
+RULE_WEIGHT = 0.50
 
 
 @dataclass
@@ -51,9 +53,10 @@ class RiskScorer:
             # Rule-only mode — upweight rule engine
             raw_score = rule_score
 
-        # Boost if rule engine fires with high severity even if ML is low
-        if rule_score >= 0.85 and raw_score < 0.70:
-            raw_score = max(raw_score, 0.70)
+        # Boost if rule engine fires with critical severity even if ML is uncertain.
+        # Use 0.90 threshold (was 0.85) to only boost on very high-confidence rule hits.
+        if rule_score >= 0.90 and raw_score < 0.72:
+            raw_score = max(raw_score, 0.72)
 
         raw_score = min(raw_score, 1.0)
 

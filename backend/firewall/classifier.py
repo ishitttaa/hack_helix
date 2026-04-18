@@ -1,6 +1,11 @@
 """
 PromptGuard ML Classifier
 Wraps the trained binary and category classifiers with lazy loading and confidence scoring.
+
+Fixes applied:
+- Load the serialised decision threshold (0.58) instead of hardcoding 0.5
+  → dramatically reduces false positives on safe prompts
+- Graceful fallback when threshold file not found
 """
 
 import os
@@ -10,9 +15,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "saved")
-BINARY_MODEL_PATH = os.path.join(MODEL_DIR, "binary_classifier.joblib")
+BINARY_MODEL_PATH   = os.path.join(MODEL_DIR, "binary_classifier.joblib")
 CATEGORY_MODEL_PATH = os.path.join(MODEL_DIR, "category_classifier.joblib")
-LABEL_ENCODER_PATH = os.path.join(MODEL_DIR, "label_encoder.joblib")
+LABEL_ENCODER_PATH  = os.path.join(MODEL_DIR, "label_encoder.joblib")
+THRESHOLD_PATH      = os.path.join(MODEL_DIR, "threshold.joblib")
+
+DEFAULT_THRESHOLD = 0.58  # conservative default if file missing
 
 
 @dataclass
@@ -38,11 +46,16 @@ class PromptClassifier:
         if self._loaded:
             return
         try:
-            self.binary_model = joblib.load(BINARY_MODEL_PATH)
+            self.binary_model   = joblib.load(BINARY_MODEL_PATH)
             self.category_model = joblib.load(CATEGORY_MODEL_PATH)
-            self.label_encoder = joblib.load(LABEL_ENCODER_PATH)
+            self.label_encoder  = joblib.load(LABEL_ENCODER_PATH)
+            # Load calibrated decision threshold
+            if os.path.exists(THRESHOLD_PATH):
+                self.threshold = float(joblib.load(THRESHOLD_PATH))
+            else:
+                self.threshold = DEFAULT_THRESHOLD
             self._loaded = True
-            print("[OK] ML models loaded.")
+            print(f"[OK] ML models loaded. Decision threshold: {self.threshold:.2f}")
         except FileNotFoundError:
             print("⚠️  ML models not found — running in rule-only mode.")
             self._loaded = False
@@ -50,6 +63,11 @@ class PromptClassifier:
     def is_ready(self) -> bool:
         self._load_models()
         return self._loaded
+
+    def reload(self):
+        """Force reload of models (e.g. after retraining)."""
+        self._loaded = False
+        self._load_models()
 
     def classify(self, text: str) -> ClassifierResult:
         self._load_models()
@@ -64,10 +82,10 @@ class PromptClassifier:
                 model_available=False,
             )
 
-        # Binary classification
+        # Binary classification — use calibrated threshold
         proba = self.binary_model.predict_proba([text])[0]
-        adv_probability = float(proba[1])  # probability of being adversarial
-        is_adversarial = adv_probability >= 0.5
+        adv_probability = float(proba[1])
+        is_adversarial = adv_probability >= self.threshold
 
         # Category classification (only for adversarial)
         predicted_category = None
