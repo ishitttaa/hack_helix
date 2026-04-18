@@ -197,35 +197,9 @@ BENIGN = [
     "How do I center a div in CSS?",
 ]
 
-def build_dataset():
-    rows = []
-
-    categories = {
-        "prompt_injection": PROMPT_INJECTION,
-        "jailbreak": JAILBREAK_DAN,
-        "system_prompt_extraction": SYSTEM_PROMPT_EXTRACTION,
-        "role_override": ROLE_OVERRIDE,
-        "data_extraction": DATA_EXTRACTION,
-        "indirect_injection": INDIRECT_INJECTION,
-    }
-
-    for category, prompts in categories.items():
-        for prompt in prompts:
-            rows.append({
-                "text": prompt,
-                "label": 1,
-                "category": category,
-            })
-
-    for prompt in BENIGN:
-        rows.append({
-            "text": prompt,
-            "label": 0,
-            "category": "benign",
-        })
-
-    # Augment with variations
-    adversarial_augmented = []
+def _augment_adversarial(rows: list[dict]) -> list[dict]:
+    """Generate lightweight text variations to improve model robustness."""
+    augmented = []
     for row in rows:
         if row["label"] == 1 and random.random() > 0.5:
             variations = [
@@ -234,18 +208,70 @@ def build_dataset():
                 row["text"] + " Please do this now.",
                 "SYSTEM: " + row["text"],
                 row["text"].replace(".", "!"),
+                "Hey, " + row["text"],
+                row["text"] + " This is urgent.",
             ]
-            for v in random.sample(variations, k=min(2, len(variations))):
-                adversarial_augmented.append({
-                    "text": v,
-                    "label": 1,
-                    "category": row["category"],
-                })
+            for v in random.sample(variations, k=min(3, len(variations))):
+                augmented.append({"text": v, "label": 1, "category": row["category"]})
+    return augmented
 
-    rows.extend(adversarial_augmented)
+
+def build_dataset(use_scraped: bool = True):
+    rows = []
+
+    # ── Curated base dataset ──────────────────────────────────────────────────
+    categories = {
+        "prompt_injection":        PROMPT_INJECTION,
+        "jailbreak":               JAILBREAK_DAN,
+        "system_prompt_extraction": SYSTEM_PROMPT_EXTRACTION,
+        "role_override":           ROLE_OVERRIDE,
+        "data_extraction":         DATA_EXTRACTION,
+        "indirect_injection":      INDIRECT_INJECTION,
+    }
+
+    for category, prompts in categories.items():
+        for prompt in prompts:
+            rows.append({"text": prompt, "label": 1, "category": category})
+
+    for prompt in BENIGN:
+        rows.append({"text": prompt, "label": 0, "category": "benign"})
+
+    base_count = len(rows)
+
+    # ── Live threat intelligence (scraped) ────────────────────────────────────
+    scraped_count = 0
+    if use_scraped:
+        try:
+            from data.threat_scraper import scrape_all
+            scrape_result = scrape_all(use_cache=True)
+            for entry in scrape_result.entries:
+                if len(entry.text.strip()) >= 15:
+                    rows.append({
+                        "text":     entry.text.strip(),
+                        "label":    entry.label,
+                        "category": entry.category,
+                    })
+                    scraped_count += 1
+        except Exception as e:
+            print(f"[Dataset] Scraper unavailable ({e}), using base dataset only.")
+
+    # ── Augmentation ─────────────────────────────────────────────────────────
+    rows.extend(_augment_adversarial(rows))
     random.shuffle(rows)
 
-    df = pd.DataFrame(rows)
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for row in rows:
+        key = row["text"].lower().strip()[:300]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(row)
+
+    import pandas as pd
+    df = pd.DataFrame(deduped)
+    print(f"[Dataset] Base: {base_count} | Scraped: {scraped_count} | "
+          f"After augment+dedup: {len(df)}")
     return df
 
 

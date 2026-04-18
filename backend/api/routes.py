@@ -355,9 +355,84 @@ async def get_logs(limit: int = 50, db: AsyncSession = Depends(get_db)):
 
 @router.get("/health")
 async def health():
+    from data.threat_scraper import get_scrape_status
     return {
         "status": "ok",
         "ml_model": risk_scorer.classifier.is_ready(),
         "openai_configured": is_openai_available(),
+        "threat_intel": get_scrape_status(),
         "version": "1.0.0",
     }
+
+
+# ─── /threat-intel ────────────────────────────────────────────────────────────
+
+@router.get("/threat-intel")
+async def threat_intel(refresh: bool = False):
+    """
+    Returns live threat intelligence metadata and triggers a fresh scrape
+    when refresh=true (or cache is stale).
+    """
+    from data.threat_scraper import scrape_all, get_scrape_status
+    import asyncio
+
+    if refresh:
+        # Run blocking scrape in executor to not block the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: scrape_all(use_cache=False))
+    else:
+        status = get_scrape_status()
+        if not status["cached"] or status.get("stale", True):
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: scrape_all(use_cache=True))
+        else:
+            return get_scrape_status()
+
+    return {
+        "cached": True,
+        "entries": len(result.entries),
+        "total_adversarial": result.total_adversarial,
+        "total_benign": result.total_benign,
+        "scraped_at": result.scraped_at,
+        "age_minutes": 0,
+        "stale": False,
+        "source_stats": result.source_stats,
+        "errors": result.errors,
+    }
+
+
+# ─── /retrain ─────────────────────────────────────────────────────────────────
+
+@router.post("/retrain")
+async def retrain_model():
+    """
+    Trigger a full re-scrape → retrain pipeline.
+    Runs in background; returns immediately with job status.
+    """
+    import asyncio
+    import subprocess
+    import sys
+
+    async def _run():
+        loop = asyncio.get_event_loop()
+        # 1. Fresh scrape (no cache)
+        from data.threat_scraper import scrape_all
+        await loop.run_in_executor(None, lambda: scrape_all(use_cache=False))
+        # 2. Retrain
+        script = __import__("os").path.join(
+            __import__("os").path.dirname(__file__), "..", "models", "train.py"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        # 3. Reload classifier
+        risk_scorer.classifier._loaded = False
+        risk_scorer.classifier._load_models()
+        return proc.returncode, stdout.decode()
+
+    asyncio.create_task(_run())
+    return {"status": "retraining_started", "message": "Scraping + retrain running in background"}
+
